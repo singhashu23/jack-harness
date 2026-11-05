@@ -96,7 +96,7 @@ mod tests {
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
         assert!(handle(&tools, &json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
         let list = handle(&tools, &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 9);
         let call = handle(&tools, &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jack_sh","arguments":{"cmd":"echo hi"}}})).unwrap();
         assert_eq!(call["result"]["isError"], false);
         assert!(call["result"]["content"][0]["text"].as_str().unwrap().contains("hi"));

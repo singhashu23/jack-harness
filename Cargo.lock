@@ -288,8 +288,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "jack-lsp",
  "jack-read",
  "jack-store",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "jack-lsp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "serde_json",
  "tempfile",
 ]

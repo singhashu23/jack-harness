@@ -27,9 +27,11 @@ pub struct Output {
 }
 
 pub struct Tools {
-    store: Store,
-    root: PathBuf,
+    pub(crate) store: Store,
+    pub(crate) root: PathBuf,
     budget: usize,
+    /// Language servers, started on first semantic query.
+    pub(crate) lsp: jack_lsp::Lsp,
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -70,7 +72,8 @@ fn cap_line_len(text: &str) -> String {
 
 impl Tools {
     pub fn new(store: Store, root: PathBuf) -> Tools {
-        Tools { store, root, budget: DEFAULT_BUDGET }
+        let lsp = jack_lsp::Lsp::new(root.clone());
+        Tools { store, root, budget: DEFAULT_BUDGET, lsp }
     }
 
     #[cfg(test)]
@@ -86,6 +89,10 @@ impl Tools {
             "jack_search" => self.jack_search(args),
             "recall" => self.recall(args),
             "checkpoint" => self.checkpoint(args),
+            "jack_def" => self.jack_def(args),
+            "jack_refs" => self.jack_refs(args),
+            "jack_rename" => self.jack_rename(args),
+            "jack_diagnostics" => self.jack_diagnostics(args),
             _ => Err(anyhow!("unknown tool {name}")),
         };
         let (text, raw, is_error) = match result {
@@ -100,7 +107,7 @@ impl Tools {
         Output { text, is_error }
     }
 
-    fn resolve(&self, p: &str) -> Result<(PathBuf, String)> {
+    pub(crate) fn resolve(&self, p: &str) -> Result<(PathBuf, String)> {
         let path = if Path::new(p).is_absolute() { PathBuf::from(p) } else { self.root.join(p) };
         let path = path.canonicalize().with_context(|| format!("{p}: not found"))?;
         let shown = path
@@ -382,7 +389,7 @@ impl Tools {
 
 /// MCP tool definitions. Descriptions steer the model toward the cheap paths.
 pub fn tool_list() -> Value {
-    json!([
+    let mut tools = json!([
         {
             "name": "jack_read",
             "description": "Read a file, token-efficiently. Small files come back whole with line numbers. Large files return an outline (symbols with line ranges); then read only what you need with symbol= or lines=. Re-reading a file you already saw returns 'unchanged' or just a diff. Prefer this over any other file-reading tool.",
@@ -449,7 +456,11 @@ pub fn tool_list() -> Value {
                 "additionalProperties": false
             }
         }
-    ])
+    ]);
+    if let Some(list) = tools.as_array_mut() {
+        list.extend(crate::semantic::semantic_tools());
+    }
+    tools
 }
 
 #[cfg(test)]

@@ -63,6 +63,9 @@ pub struct Symbol {
     pub start_line: usize,
     pub end_line: usize,
     pub depth: usize,
+    /// Position of the symbol's name token: 0-based row and 0-based byte
+    /// column. LSP queries aim here.
+    pub name_pos: (usize, usize),
 }
 
 /// What a node means for the outline.
@@ -139,6 +142,14 @@ fn symbol_name(lang: Lang, node: Node, src: &[u8]) -> Option<String> {
     }
 }
 
+/// The token that names a symbol node (where an LSP query should point).
+fn name_node(lang: Lang, node: Node) -> Option<Node> {
+    match (lang, node.kind()) {
+        (Lang::Rust, "impl_item") => node.child_by_field_name("type"),
+        _ => node.child_by_field_name("name"),
+    }
+}
+
 /// JS/TS `const foo = () => {}` and `const foo = function () {}`.
 fn arrow_binding(lang: Lang, node: Node, src: &[u8]) -> Option<String> {
     if !matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript)
@@ -164,8 +175,12 @@ fn walk(
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
+        let name_pos = name_node(lang, child)
+            .map(|n| (n.start_position().row, n.start_position().column))
+            .unwrap_or((child.start_position().row, child.start_position().column));
         let push = |out: &mut Vec<Symbol>, kind, name: String| {
             out.push(Symbol {
+                name_pos,
                 kind,
                 name,
                 parent: parent.map(str::to_string),

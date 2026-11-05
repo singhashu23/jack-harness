@@ -1,4 +1,5 @@
 mod mcp;
+mod semantic;
 mod tools;
 
 use anyhow::{Context, Result};
