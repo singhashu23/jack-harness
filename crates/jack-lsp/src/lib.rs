@@ -505,6 +505,10 @@ impl Client {
                     json!({"textDocument": {"uri": uri, "languageId": language_id, "version": 1, "text": text}}),
                 )?;
                 docs.insert(uri, (1, hash));
+                drop(docs);
+                // Some servers (tsserver) only load the project once a file is
+                // opened; wait for that work before the first query.
+                self.wait_ready(Duration::from_secs(60));
             }
             Some((version, old)) if *old != hash => {
                 *version += 1;

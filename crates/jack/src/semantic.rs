@@ -324,6 +324,45 @@ mod tests {
         assert!(g.contains("error"), "{g}");
     }
 
+    /// Live test against gopls; skipped when it isn't installed.
+    #[test]
+    fn gopls_live() {
+        if !on_path("gopls") {
+            eprintln!("skipping: gopls not installed");
+            return;
+        }
+        let (_dir, t) = project(&[
+            ("go.mod", "module demo\n\ngo 1.21\n"),
+            ("util.go", "package main\n\nfunc helper(x int) int {\n\treturn x + 1\n}\n"),
+            ("main.go", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(helper(1) + helper(2))\n}\n"),
+        ]);
+        let d = ok(&t, "jack_def", json!({"symbol": "helper", "path": "main.go", "line": 6}));
+        assert!(d.contains("util.go:3") && d.contains("return x + 1"), "{d}");
+        let r = ok(&t, "jack_refs", json!({"symbol": "helper", "path": "util.go"}));
+        assert!(r.contains("3 references") && r.contains("main.go"), "{r}");
+    }
+
+    /// Live test against typescript-language-server; skipped when it isn't installed.
+    #[test]
+    fn typescript_live() {
+        if !on_path("typescript-language-server") {
+            eprintln!("skipping: typescript-language-server not installed");
+            return;
+        }
+        let (_dir, t) = project(&[
+            ("tsconfig.json", "{\"compilerOptions\": {\"strict\": true}}\n"),
+            ("util.ts", "export function helper(x: number): number {\n  return x + 1;\n}\n"),
+            ("main.ts", "import { helper } from \"./util\";\n\nconsole.log(helper(1) + helper(2));\n"),
+        ]);
+        // References first, on a cold server: the project must be loaded
+        // before answering, or usages in unopened files are missed.
+        let r = ok(&t, "jack_refs", json!({"symbol": "helper", "path": "util.ts"}));
+        assert!(r.contains("main.ts") && r.contains("console.log(helper(1)"), "{r}");
+        // From a usage, the definition must follow the import to util.ts.
+        let d = ok(&t, "jack_def", json!({"symbol": "helper", "path": "main.ts", "line": 3}));
+        assert!(d.contains("util.ts:1") && d.contains("return x + 1"), "{d}");
+    }
+
     /// Live test against pyright; skipped when it isn't installed.
     #[test]
     fn pyright_live() {
