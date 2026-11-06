@@ -1,16 +1,18 @@
 # jack
 
 A self-hosted, token-efficient coding-agent harness. Design: see the jack design docs
-(Problems 1–6). This repo currently covers build steps 1–2: the session store and the
-jack MCP server, which any MCP client (Claude Code, Cursor Agent, Goose) can use today.
+(Problems 1–6). This repo currently covers build steps 1–2: the session store, a recorder for Claude
+Code sessions, and the jack MCP server, which any MCP client (Claude Code, Cursor
+Agent, Goose) can use today.
 
 ## Crates
 
 | Crate | What it does |
 | --- | --- |
 | `jack-store` | One SQLite file per session: content-addressed blobs, an FTS5 index for `recall`, what each file looked like when last shown, and a tool-call log with raw vs. sent bytes |
+| `jack-lsp` | A dependency-free LSP client: starts language servers on demand and answers definition, references, rename and diagnostics |
 | `jack-read` | tree-sitter outlines (Rust, Python, TypeScript/TSX, JavaScript, Go), symbol lookup, line slicing, diffs, output trimming |
-| `jack` | The binary: MCP server (`jack mcp`) and CLI (`jack read`, `jack outline`, `jack stats`) |
+| `jack` | The binary: MCP server (`jack mcp`), recorder (`jack hook record`, `jack import`) and CLI (`jack read`, `jack outline`, `jack stats`, `jack sessions`) |
 
 ## MCP tools
 
@@ -21,6 +23,26 @@ jack MCP server, which any MCP client (Claude Code, Cursor Agent, Goose) can use
 | `jack_sh(cmd, timeout_secs?)` | Exit code plus output trimmed to head, error/warning lines and tail; the full output is stored |
 | `recall(handle?, lines?, query?)` | A page of a stored output, or a keyword search over everything stored this session |
 | `checkpoint(note)` | Saves a progress note for later briefings |
+| `jack_def(symbol, path, line?)` | The definition's code, via the language server |
+| `jack_refs(symbol, path, line?)` | Every reference, grouped by file with each line |
+| `jack_rename(symbol, path, new_name, dry_run?)` | Renames across files; all-or-nothing |
+| `jack_diagnostics(path)` | Errors and warnings from the language server |
+
+Language servers (Arch): `sudo pacman -S rust-analyzer pyright gopls typescript-language-server`.
+
+## Recording Claude Code sessions
+
+Add `jack hook record` as a `Stop`, `PreCompact` and `SessionEnd` hook in
+`.claude/settings.json`. Each Claude session is copied into
+`~/.jack/sessions/cc-<session id>/store.db`, including subagent transcripts. Ingest
+is incremental and idempotent, and the hook always exits 0 (errors go to
+`~/.jack/hook.log`).
+
+```sh
+jack import          # backfill every transcript in ~/.claude/projects
+jack sessions        # tokens and approximate API cost per session
+jack session <id>    # model usage and which tools filled the context
+```
 
 ## Use
 

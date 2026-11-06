@@ -60,6 +60,36 @@ pub struct Stats {
     pub sent_bytes: i64,
 }
 
+/// One content block of a recorded agent transcript.
+#[derive(Debug, Clone, Default)]
+pub struct Msg {
+    pub uuid: String,
+    pub idx: usize,
+    pub ts: Option<String>,
+    /// "main", or the subagent transcript it came from.
+    pub source: String,
+    /// user, user_meta, assistant, thinking, tool_use, tool_result
+    pub kind: String,
+    pub tool: Option<String>,
+    pub tool_id: Option<String>,
+    pub handle: Option<String>,
+    pub bytes: usize,
+    pub is_error: bool,
+}
+
+/// Token usage of one model response.
+#[derive(Debug, Clone, Default)]
+pub struct Usage {
+    pub msg_id: String,
+    pub ts: Option<String>,
+    pub source: String,
+    pub model: Option<String>,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -116,7 +146,32 @@ impl Store {
                  tool       TEXT,
                  payload    TEXT,
                  raw_bytes  INTEGER NOT NULL DEFAULT 0,
-                 sent_bytes INTEGER NOT NULL DEFAULT 0);",
+                 sent_bytes INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS meta(
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS msgs(
+                 uuid     TEXT NOT NULL,
+                 idx      INTEGER NOT NULL,
+                 ts       TEXT,
+                 source   TEXT NOT NULL,
+                 kind     TEXT NOT NULL,
+                 tool     TEXT,
+                 tool_id  TEXT,
+                 handle   TEXT,
+                 bytes    INTEGER NOT NULL DEFAULT 0,
+                 is_error INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(uuid, idx));
+             CREATE INDEX IF NOT EXISTS msgs_tool_id ON msgs(tool_id);
+             CREATE TABLE IF NOT EXISTS usage(
+                 msg_id      TEXT PRIMARY KEY,
+                 ts          TEXT,
+                 source      TEXT NOT NULL,
+                 model       TEXT,
+                 input       INTEGER NOT NULL,
+                 output      INTEGER NOT NULL,
+                 cache_read  INTEGER NOT NULL,
+                 cache_write INTEGER NOT NULL);",
         )?;
         Ok(Store { conn })
     }
@@ -208,6 +263,115 @@ impl Store {
         Ok(())
     }
 
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Run `f` in one transaction (much faster for bulk ingest).
+    pub fn in_tx<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f(self) {
+            Ok(v) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Record one transcript content block. Idempotent on (uuid, idx).
+    /// Returns true if it was new.
+    pub fn insert_msg(&self, m: &Msg) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO msgs(uuid, idx, ts, source, kind, tool, tool_id, handle, bytes, is_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![m.uuid, m.idx as i64, m.ts, m.source, m.kind, m.tool, m.tool_id, m.handle, m.bytes as i64, m.is_error],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Name of the tool a `tool_use` id belongs to, if recorded.
+    pub fn tool_for_id(&self, tool_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT tool FROM msgs WHERE tool_id = ?1 AND kind = 'tool_use' LIMIT 1",
+                [tool_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record (or update) token usage for one API response. A response is
+    /// split over several transcript entries that all repeat its usage, so
+    /// this keys on the message id instead of summing entries.
+    pub fn upsert_usage(&self, u: &Usage) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO usage(msg_id, ts, source, model, input, output, cache_read, cache_write)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(msg_id) DO UPDATE SET ts=excluded.ts, model=excluded.model,
+                 input=excluded.input, output=excluded.output,
+                 cache_read=excluded.cache_read, cache_write=excluded.cache_write",
+            params![u.msg_id, u.ts, u.source, u.model, u.input, u.output, u.cache_read, u.cache_write],
+        )?;
+        Ok(())
+    }
+
+    /// Token totals per model.
+    pub fn usage_by_model(&self) -> Result<Vec<(String, Usage)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(model, '?'), COUNT(*), SUM(input), SUM(output), SUM(cache_read), SUM(cache_write)
+             FROM usage GROUP BY 1 ORDER BY 2 DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Usage {
+                    msg_id: format!("{} responses", r.get::<_, i64>(1)?),
+                    input: r.get(2)?,
+                    output: r.get(3)?,
+                    cache_read: r.get(4)?,
+                    cache_write: r.get(5)?,
+                    ..Default::default()
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Count of recorded blocks per kind (user, assistant, tool_use, ...).
+    pub fn msg_counts(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare("SELECT kind, COUNT(*) FROM msgs GROUP BY 1 ORDER BY 2 DESC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Per tool: calls and total bytes of results returned into context.
+    pub fn tool_result_bytes(&self) -> Result<Vec<(String, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(tool, '?'), COUNT(*), SUM(bytes) FROM msgs
+             WHERE kind = 'tool_result' GROUP BY 1 ORDER BY 3 DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Per-tool totals of raw bytes (what an unshaped tool would have sent)
     /// vs. bytes actually sent to the model.
     pub fn stats(&self) -> Result<Vec<(String, Stats)>> {
@@ -252,6 +416,23 @@ mod tests {
         assert!(b > a);
         let r = s.last_read("a.rs").unwrap().unwrap();
         assert_eq!((r.hash.as_str(), r.view), ("h2", View::Full));
+    }
+
+    #[test]
+    fn transcript_rows_are_idempotent() {
+        let s = Store::open_in_memory().unwrap();
+        let m = Msg { uuid: "u1".into(), kind: "tool_use".into(), tool: Some("Read".into()), tool_id: Some("t1".into()), source: "main".into(), ..Default::default() };
+        assert!(s.insert_msg(&m).unwrap());
+        assert!(!s.insert_msg(&m).unwrap());
+        assert_eq!(s.tool_for_id("t1").unwrap().as_deref(), Some("Read"));
+        let u = Usage { msg_id: "m1".into(), source: "main".into(), model: Some("x".into()), input: 1, output: 2, cache_read: 3, cache_write: 4, ..Default::default() };
+        s.upsert_usage(&u).unwrap();
+        s.upsert_usage(&u).unwrap();
+        let by = s.usage_by_model().unwrap();
+        assert_eq!((by[0].1.input, by[0].1.output, by[0].1.cache_read), (1, 2, 3));
+        s.set_meta("k", "1").unwrap();
+        s.set_meta("k", "2").unwrap();
+        assert_eq!(s.get_meta("k").unwrap().as_deref(), Some("2"));
     }
 
     #[test]

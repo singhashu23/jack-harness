@@ -1,4 +1,5 @@
 mod mcp;
+mod recorder;
 mod semantic;
 mod tools;
 
@@ -46,6 +47,72 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Claude Code hook entry points.
+    Hook {
+        #[command(subcommand)]
+        action: HookCmd,
+    },
+    /// Import Claude Code transcripts (default: all of ~/.claude/projects).
+    Import { paths: Vec<PathBuf> },
+    /// Recorded Claude Code sessions: tokens, approximate API cost, top tools.
+    Sessions {
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+    },
+    /// One recorded session in detail (id or id prefix).
+    Session { id: String },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// Record the session in the hook payload (stdin). Always exits 0.
+    Record,
+}
+
+/// Recorded Claude Code session stores, newest first.
+fn recorded_sessions() -> Vec<(String, PathBuf, std::time::SystemTime)> {
+    let dir = jack_home().join("sessions");
+    let mut out: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let id = name.strip_prefix("cc-")?.to_string();
+            let db = e.path().join("store.db");
+            let t = db.metadata().and_then(|m| m.modified()).ok()?;
+            Some((id, db, t))
+        })
+        .collect();
+    out.sort_by_key(|e| std::cmp::Reverse(e.2));
+    out
+}
+
+fn human(n: i64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 1_000 => format!("{:.1}k", n as f64 / 1e3),
+        n => n.to_string(),
+    }
+}
+
+/// Totals over models, plus approximate cost (None if any model is unpriced).
+fn session_totals(store: &Store) -> Result<(jack_store::Usage, Option<f64>)> {
+    let mut t = jack_store::Usage::default();
+    let mut cost = Some(0.0);
+    for (model, u) in store.usage_by_model()? {
+        t.input += u.input;
+        t.output += u.output;
+        t.cache_read += u.cache_read;
+        t.cache_write += u.cache_write;
+        if u.input + u.output + u.cache_read + u.cache_write > 0 {
+            cost = match (cost, recorder::cost(&model, &u)) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            };
+        }
+    }
+    Ok((t, cost))
 }
 
 fn jack_home() -> PathBuf {
@@ -87,6 +154,84 @@ fn main() -> Result<()> {
             let src = std::fs::read_to_string(&path)?;
             let syms = jack_read::outline(&src, lang);
             print!("{}", jack_read::render_outline(&path.display().to_string(), lang, src.lines().count(), &syms));
+            Ok(())
+        }
+        Cmd::Hook { action: HookCmd::Record } => {
+            recorder::hook_record(&jack_home());
+            Ok(())
+        }
+        Cmd::Import { paths } => {
+            let paths = if paths.is_empty() { recorder::all_transcripts() } else { paths };
+            let (mut sessions, mut blocks, mut failed) = (0, 0, 0);
+            for p in &paths {
+                let Some(id) = p.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
+                match recorder::ingest_session(&jack_home(), p, &id) {
+                    Ok(n) => {
+                        sessions += 1;
+                        blocks += n;
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("{}: {e:#}", p.display());
+                    }
+                }
+            }
+            println!("imported {sessions} sessions, {blocks} new blocks, {failed} failed");
+            Ok(())
+        }
+        Cmd::Sessions { limit } => {
+            println!(
+                "{:<10} {:<22} {:>7} {:>6} {:>8} {:>9} {:>9} {:>8} {:>9}",
+                "session", "project", "prompts", "tools", "input", "cache rd", "cache wr", "output", "api $"
+            );
+            for (id, db, _) in recorded_sessions().into_iter().take(limit) {
+                let store = Store::open(&db)?;
+                let counts: std::collections::HashMap<String, i64> = store.msg_counts()?.into_iter().collect();
+                let (t, cost) = session_totals(&store)?;
+                let project = store.get_meta("cwd")?.and_then(|c| c.rsplit('/').next().map(str::to_string)).unwrap_or_default();
+                println!(
+                    "{:<10} {:<22} {:>7} {:>6} {:>8} {:>9} {:>9} {:>8} {:>9}",
+                    &id[..id.len().min(8)],
+                    project.chars().take(22).collect::<String>(),
+                    counts.get("user").copied().unwrap_or(0),
+                    counts.get("tool_use").copied().unwrap_or(0),
+                    human(t.input),
+                    human(t.cache_read),
+                    human(t.cache_write),
+                    human(t.output),
+                    cost.map_or("?".to_string(), |c| format!("{c:.2}")),
+                );
+            }
+            println!("(api $ = approximate pay-as-you-go API price; cache writes at the 5-minute rate)");
+            Ok(())
+        }
+        Cmd::Session { id } => {
+            let matches: Vec<_> = recorded_sessions().into_iter().filter(|(s, _, _)| s.starts_with(&id)).collect();
+            let (sid, db, _) = match matches.as_slice() {
+                [one] => one.clone(),
+                [] => anyhow::bail!("no recorded session starts with {id:?}"),
+                _ => anyhow::bail!("{} sessions start with {id:?}; give more of the id", matches.len()),
+            };
+            let store = Store::open(&db)?;
+            println!("session {sid}");
+            if let Some(c) = store.get_meta("cwd")? {
+                println!("project {c}");
+            }
+            println!("\nmodel usage:");
+            for (model, u) in store.usage_by_model()? {
+                let c = recorder::cost(&model, &u).map_or("?".to_string(), |c| format!("${c:.2}"));
+                println!(
+                    "  {model:<20} {:<14} input {:>7}  cache read {:>7}  cache write {:>7}  output {:>7}  {c}",
+                    u.msg_id, human(u.input), human(u.cache_read), human(u.cache_write), human(u.output)
+                );
+            }
+            let tools = store.tool_result_bytes()?;
+            let total: i64 = tools.iter().map(|t| t.2).sum();
+            println!("\ntool results returned into context (~4 bytes per token):");
+            for (tool, calls, bytes) in &tools {
+                let share = if total > 0 { 100.0 * *bytes as f64 / total as f64 } else { 0.0 };
+                println!("  {tool:<28} {calls:>5} calls  ~{:>7} tokens  {share:>5.1}%", human(bytes / 4));
+            }
             Ok(())
         }
         Cmd::Stats { session } => {
