@@ -2,6 +2,9 @@
 name = "jack-engines"
 version = "0.1.0"
 edition = "2024"
+description = "Headless adapters for Claude Code and Cursor Agent, used by jack"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/singhashu23/jack-harness"
 
 [dependencies]
 anyhow = "1.0.104"

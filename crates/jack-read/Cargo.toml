@@ -2,6 +2,9 @@
 name = "jack-read"
 version = "0.1.0"
 edition = "2024"
+description = "tree-sitter outlines, symbol lookup and output shaping for jack"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/singhashu23/jack-harness"
 
 [dependencies]
 anyhow = "1.0.104"

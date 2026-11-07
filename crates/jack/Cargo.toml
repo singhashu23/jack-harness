@@ -2,6 +2,9 @@
 name = "jack"
 version = "0.1.0"
 edition = "2024"
+description = "A self-hosted, token-efficient coding-agent harness and orchestrator"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/singhashu23/jack-harness"
 
 [dependencies]
 anyhow = "1.0.104"
