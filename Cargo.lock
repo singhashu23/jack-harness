@@ -291,6 +291,7 @@ dependencies = [
  "jack-lsp",
  "jack-read",
  "jack-store",
+ "libc",
  "serde_json",
  "tempfile",
 ]

@@ -126,6 +126,12 @@ fn session_store(id: &str) -> Result<Store> {
 }
 
 fn main() -> Result<()> {
+    // Rust ignores SIGPIPE, so `jack sessions | head` would panic on a closed
+    // pipe. Restore the default: exit quietly, like other CLI tools.
+    // SAFETY: called once at startup, before any other threads exist.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     match Cli::parse().cmd {
         Cmd::Mcp { root, session } => {
             let root = root.unwrap_or(std::env::current_dir()?).canonicalize()?;
