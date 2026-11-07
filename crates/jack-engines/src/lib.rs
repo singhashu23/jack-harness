@@ -7,7 +7,7 @@
 //! against recorded output (design doc, Problem 5).
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
     /// Plan / read-only: no edits, no shell.
@@ -36,6 +36,8 @@ pub struct RunSpec {
     /// Attach jack's MCP server and route file reads through it.
     pub jack_tools: Option<PathBuf>,
     pub timeout: Duration,
+    /// Extra environment variables for the agent (e.g. its port range).
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -70,6 +72,8 @@ pub struct RunResult {
     pub tool_calls: Vec<ToolCall>,
     pub files_changed: Vec<String>,
     pub diff_stat: String,
+    /// Claude's 5-hour quota window utilization (0..1), when reported.
+    pub quota_5h: Option<f64>,
 }
 
 /// Progress events, for live display while a run is going.
@@ -164,6 +168,11 @@ pub fn parse_claude(d: &Value, acc: &mut Acc) -> Vec<Event> {
                     acc.result.tool_calls[idx].ok = ok;
                     ev.push(Event::ToolDone { name: acc.result.tool_calls[idx].name.clone(), ok });
                 }
+            }
+        }
+        (Some("rate_limit_event"), _) => {
+            if let Some(u) = d.pointer("/rate_limit_info/unifiedWindows/five_hour/utilization").and_then(Value::as_f64) {
+                acc.result.quota_5h = Some(u);
             }
         }
         (Some("result"), sub) => {
@@ -319,6 +328,10 @@ pub fn cursor_command(spec: &RunSpec) -> Command {
             c.arg("--force");
         }
     }
+    if spec.jack_tools.is_some() {
+        // The orchestrator writes .cursor/mcp.json into the worktree.
+        c.arg("--approve-mcps");
+    }
     if let Some(m) = &spec.model {
         c.args(["--model", m]);
     }
@@ -410,6 +423,7 @@ pub fn run(engine: Engine, spec: &RunSpec, log: &Path, mut on_event: impl FnMut(
     let mut child = engine
         .command(spec)
         .current_dir(&spec.cwd)
+        .envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -512,6 +526,7 @@ mod tests {
         assert_eq!(r.usage, Usage { input: 6, output: 345, cache_read: 47362, cache_write: 10426 });
         assert!((r.session_cost_usd.unwrap() - 0.0998044).abs() < 1e-6);
         assert_eq!(r.num_turns, Some(3));
+        assert_eq!(r.quota_5h, Some(0.11), "last rate_limit_event wins");
         let tools: Vec<_> = r.tool_calls.iter().map(|t| (t.name.as_str(), t.ok)).collect();
         assert_eq!(tools, vec![("Read", true), ("Edit", true)]);
     }
@@ -540,6 +555,7 @@ mod tests {
             access,
             jack_tools: None,
             timeout: Duration::from_secs(1),
+            env: vec![],
         };
         let args = |c: Command| c.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
         let c = args(claude_command(&spec(Access::Read)));

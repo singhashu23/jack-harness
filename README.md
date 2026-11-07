@@ -45,6 +45,32 @@ jack sessions        # tokens and approximate API cost per session
 jack session <id>    # model usage and which tools filled the context
 ```
 
+## Tasks: routing, worktrees, review
+
+```sh
+jack task "fix the failing test in parser.rs"   # routed; runs in its own git worktree
+jack task --dry-run "..."                       # show the routing decision and briefing only
+jack tasks                                      # status of all tasks
+jack review <id>                                # the task branch's diff
+jack merge <id>                                 # merge into your current branch, clean up
+jack drop <id>                                  # discard the worktree and branch
+```
+
+- **Routing** is rule-based and printed: questions get `read` access, anything that
+  runs tests or builds gets `full`, and everything else gets `edit`. Debugging and design
+  work goes to Claude, small well-defined changes go to Cursor, and Claude is the
+  default. When Claude's 5-hour quota passes 90%, tasks go to Cursor. Override with
+  `--engine` / `--access`.
+- **Isolation**: each task runs in `~/.jack/worktrees/<repo>-<id>` on branch `jack/<id>`,
+  with its own 20-port range (`JACK_PORT_BASE`, `PORT`), so parallel tasks don't
+  collide. Your working tree is untouched until `jack merge`.
+- **Briefing**: the agent gets the repo state, earlier jack tasks in this repo,
+  `checkpoint` notes and recent Claude Code sessions, capped at about 1.5k tokens.
+- **Results**: changes are committed to the task branch. Tasks with no changes clean
+  up after themselves.
+- `--jack-tools` works for both engines. For Cursor, jack writes `.cursor/mcp.json` and
+  `.cursor/cli.json` (allowlist) into the worktree; they are never committed.
+
 ## Driving other agents
 
 ```sh

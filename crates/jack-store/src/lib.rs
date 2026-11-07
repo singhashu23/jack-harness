@@ -8,7 +8,7 @@
 //! - `events`: one row per tool call, with raw vs. sent byte counts
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 /// How much of a file the model last saw.
@@ -116,6 +116,16 @@ impl Store {
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         Self::init(conn)
+    }
+
+    /// Open another session's store without writing to it (no schema
+    /// setup, no pragmas), so the one-writer-per-file rule holds while that
+    /// session may still be running.
+    pub fn open_readonly(path: &Path) -> Result<Store> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .with_context(|| format!("opening {} read-only", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Store { conn })
     }
 
     pub fn open_in_memory() -> Result<Store> {
@@ -374,6 +384,29 @@ impl Store {
 
     /// Per-tool totals of raw bytes (what an unshaped tool would have sent)
     /// vs. bytes actually sent to the model.
+    /// Payloads of all events of one kind, oldest first: (unix time, payload).
+    pub fn events_of_kind(&self, kind: &str) -> Result<Vec<(i64, serde_json::Value)>> {
+        let mut stmt = self.conn.prepare("SELECT ts, payload FROM events WHERE kind = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([kind], |r| {
+            let p: Option<String> = r.get(1)?;
+            Ok((r.get(0)?, p.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default()))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Text of the first recorded block of a kind (e.g. a session's first prompt).
+    pub fn first_text(&self, kind: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT b.content FROM msgs m JOIN blobs b ON b.handle = m.handle
+                 WHERE m.kind = ?1 ORDER BY m.ts, m.rowid LIMIT 1",
+                [kind],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn stats(&self) -> Result<Vec<(String, Stats)>> {
         let mut stmt = self.conn.prepare(
             "SELECT COALESCE(tool, kind), COUNT(*), SUM(raw_bytes), SUM(sent_bytes)
@@ -433,6 +466,23 @@ mod tests {
         s.set_meta("k", "1").unwrap();
         s.set_meta("k", "2").unwrap();
         assert_eq!(s.get_meta("k").unwrap().as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn readonly_open_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.db");
+        {
+            let s = Store::open(&p).unwrap();
+            s.log_event("checkpoint", None, &serde_json::json!({"note": "n1"}), 0, 0).unwrap();
+        }
+        let before = std::fs::read(&p).unwrap();
+        let ro = Store::open_readonly(&p).unwrap();
+        let ev = ro.events_of_kind("checkpoint").unwrap();
+        assert_eq!(ev[0].1["note"], "n1");
+        assert!(ro.log_event("x", None, &serde_json::json!({}), 0, 0).is_err(), "read-only store must refuse writes");
+        drop(ro);
+        assert_eq!(before, std::fs::read(&p).unwrap());
     }
 
     #[test]

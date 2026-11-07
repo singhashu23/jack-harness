@@ -1,4 +1,5 @@
 mod mcp;
+mod orchestrator;
 mod recorder;
 mod semantic;
 mod tools;
@@ -8,6 +9,7 @@ use clap::{Parser, Subcommand};
 use jack_store::Store;
 use serde_json::json;
 use std::path::PathBuf;
+use std::process::Command;
 use tools::Tools;
 
 /// jack: a token-efficient coding-agent harness.
@@ -86,6 +88,45 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Route a task to an engine and run it in its own git worktree.
+    Task {
+        prompt: String,
+        /// Override routing: claude or cursor.
+        #[arg(long)]
+        engine: Option<String>,
+        /// Override routing: read, edit or full.
+        #[arg(long)]
+        access: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Attach jack's MCP tools to the agent.
+        #[arg(long)]
+        jack_tools: bool,
+        /// Repository to work on (default: cwd).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long, default_value_t = 1800)]
+        timeout_secs: u64,
+        /// Only print the routing decision and briefing; run nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Tasks, newest first.
+    Tasks {
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+    },
+    /// Show a task's changes (diff of its branch).
+    Review {
+        id: String,
+        /// Only the summary and file stats.
+        #[arg(long)]
+        stat: bool,
+    },
+    /// Merge a ready task's branch into the repo's current branch.
+    Merge { id: String },
+    /// Discard a task: remove its worktree and branch.
+    Drop { id: String },
     /// Past `jack run`s, newest first.
     Runs {
         #[arg(long, default_value_t = 15)]
@@ -223,7 +264,7 @@ fn main() -> Result<()> {
                 "session", "project", "prompts", "tools", "input", "cache rd", "cache wr", "output", "api $"
             );
             for (id, db, _) in recorded_sessions().into_iter().take(limit) {
-                let store = Store::open(&db)?;
+                let store = Store::open_readonly(&db)?;
                 let counts: std::collections::HashMap<String, i64> = store.msg_counts()?.into_iter().collect();
                 let (t, cost) = session_totals(&store)?;
                 let project = store.get_meta("cwd")?.and_then(|c| c.rsplit('/').next().map(str::to_string)).unwrap_or_default();
@@ -250,7 +291,7 @@ fn main() -> Result<()> {
                 [] => anyhow::bail!("no recorded session starts with {id:?}"),
                 _ => anyhow::bail!("{} sessions start with {id:?}; give more of the id", matches.len()),
             };
-            let store = Store::open(&db)?;
+            let store = Store::open_readonly(&db)?;
             println!("session {sid}");
             if let Some(c) = store.get_meta("cwd")? {
                 println!("project {c}");
@@ -295,6 +336,7 @@ fn main() -> Result<()> {
                 access,
                 jack_tools: jack_bin,
                 timeout: std::time::Duration::from_secs(timeout_secs),
+                env: vec![],
             };
             let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
             let dir = jack_home().join("runs").join(format!("{stamp}-{}", engine.name()));
@@ -340,6 +382,117 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Task { prompt, engine, access, model, jack_tools, cwd, timeout_secs, dry_run } => {
+            use jack_engines::{Access, Engine, Event};
+            let engine = engine
+                .map(|e| Engine::parse(&e).with_context(|| format!("unknown engine {e:?} (claude, cursor)")))
+                .transpose()?;
+            let access = access
+                .map(|a| match a.as_str() {
+                    "read" => Ok(Access::Read),
+                    "edit" => Ok(Access::Edit),
+                    "full" => Ok(Access::Full),
+                    a => Err(anyhow::anyhow!("unknown access {a:?} (read, edit, full)")),
+                })
+                .transpose()?;
+            let cwd = cwd.unwrap_or(std::env::current_dir()?).canonicalize()?;
+            let home = jack_home();
+            if dry_run {
+                let repo = orchestrator::repo_root(&cwd)?;
+                let r = orchestrator::route(&prompt, None);
+                println!("route: {}", r.reason);
+                let preview = orchestrator::Task {
+                    id: "preview".into(),
+                    repo: repo.clone(),
+                    worktree: PathBuf::new(),
+                    branch: "jack/preview".into(),
+                    base: "HEAD".into(),
+                    port_base: 41000,
+                    engine: engine.unwrap_or(r.engine).name().into(),
+                    access: access.unwrap_or(r.access),
+                    route_reason: r.reason,
+                    prompt: prompt.clone(),
+                    status: "preview".into(),
+                    session_id: None,
+                    summary: None,
+                    files_changed: vec![],
+                    commit: None,
+                    run_dir: None,
+                    created: 0,
+                };
+                print!("\n{}", orchestrator::briefing(&home, &repo, &preview));
+                return Ok(());
+            }
+            let opts = orchestrator::TaskOpts {
+                engine,
+                access,
+                model,
+                jack_tools,
+                timeout: std::time::Duration::from_secs(timeout_secs),
+            };
+            let t = orchestrator::run_task(&home, &cwd, &prompt, opts, |e| match e {
+                Event::Started { session_id, model } => {
+                    eprintln!("session {session_id} ({})", model.as_deref().unwrap_or("?"))
+                }
+                Event::Tool { name, detail } => eprintln!("  -> {name} {detail}"),
+                Event::ToolDone { name, ok: false } => eprintln!("  !! {name} failed"),
+                _ => {}
+            })?;
+            println!("task {}  [{}]  {}", t.id, t.status, t.route_reason);
+            println!("{}", t.summary.as_deref().unwrap_or("").trim());
+            match t.status.as_str() {
+                "ready" => {
+                    println!("\nchanged: {}  (commit {} on {})", t.files_changed.join(", "), t.commit.as_deref().unwrap_or("?"), t.branch);
+                    println!("next: jack review {0}  |  jack merge {0}  |  jack drop {0}", t.id);
+                }
+                "done" => println!("\n(no file changes)"),
+                _ => {}
+            }
+            if t.status == "failed" {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Tasks { limit } => {
+            println!("{:<9} {:<8} {:<7} {:<6} {:>5}  task", "task", "status", "engine", "access", "files");
+            for t in orchestrator::list_tasks(&jack_home())?.into_iter().take(limit) {
+                let task: String = t.prompt.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
+                println!(
+                    "{:<9} {:<8} {:<7} {:<6} {:>5}  {task}",
+                    t.id, t.status, t.engine, orchestrator::access_name(t.access), t.files_changed.len()
+                );
+            }
+            Ok(())
+        }
+        Cmd::Review { id, stat } => {
+            let t = orchestrator::load_task(&jack_home(), &id)?;
+            println!("task {}  [{}]  {}\nroute: {}\n\n{}\n", t.id, t.status, t.prompt, t.route_reason, t.summary.as_deref().unwrap_or("").trim());
+            if t.status != "ready" {
+                println!("(no branch to review: task is {})", t.status);
+                return Ok(());
+            }
+            let range = format!("{}..{}", t.base, t.branch);
+            let mut args = vec!["diff", "--stat"];
+            if !stat {
+                args = vec!["diff", "--stat", "--patch"];
+            }
+            args.push(&range);
+            let out = Command::new("git").args(&args).current_dir(&t.repo).output()?;
+            print!("{}", String::from_utf8_lossy(&out.stdout));
+            Ok(())
+        }
+        Cmd::Merge { id } => {
+            let mut t = orchestrator::load_task(&jack_home(), &id)?;
+            let into = orchestrator::merge_task(&jack_home(), &mut t)?;
+            println!("merged task {} ({}) into {into}", t.id, t.files_changed.join(", "));
+            Ok(())
+        }
+        Cmd::Drop { id } => {
+            let mut t = orchestrator::load_task(&jack_home(), &id)?;
+            orchestrator::drop_task(&jack_home(), &mut t)?;
+            println!("dropped task {}", t.id);
+            Ok(())
+        }
         Cmd::Runs { limit } => {
             let mut dirs: Vec<PathBuf> = std::fs::read_dir(jack_home().join("runs"))
                 .into_iter()
@@ -382,7 +535,7 @@ fn main() -> Result<()> {
                 if !path.exists() {
                     continue;
                 }
-                for (tool, s) in Store::open(&path)?.stats()? {
+                for (tool, s) in Store::open_readonly(&path)?.stats()? {
                     let t = totals.entry(tool).or_default();
                     t.0 += s.calls;
                     t.1 += s.raw_bytes;
