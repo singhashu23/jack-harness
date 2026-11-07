@@ -59,6 +59,38 @@ enum Cmd {
         #[arg(long, default_value_t = 15)]
         limit: usize,
     },
+    /// Run a task on an agent CLI headless and report what it did.
+    Run {
+        /// The task.
+        prompt: String,
+        /// claude or cursor.
+        #[arg(long, default_value = "claude")]
+        engine: String,
+        /// Working directory (default: cwd).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Continue an earlier session of the same engine.
+        #[arg(long)]
+        resume: Option<String>,
+        /// read (no edits), edit (edits, no shell) or full (edits and shell).
+        #[arg(long, default_value = "edit")]
+        access: String,
+        /// Attach jack's MCP tools and route file reads through them (claude only for now).
+        #[arg(long)]
+        jack_tools: bool,
+        #[arg(long, default_value_t = 1800)]
+        timeout_secs: u64,
+        /// Print the full result as JSON instead of a summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Past `jack run`s, newest first.
+    Runs {
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+    },
     /// One recorded session in detail (id or id prefix).
     Session { id: String },
 }
@@ -237,6 +269,102 @@ fn main() -> Result<()> {
             for (tool, calls, bytes) in &tools {
                 let share = if total > 0 { 100.0 * *bytes as f64 / total as f64 } else { 0.0 };
                 println!("  {tool:<28} {calls:>5} calls  ~{:>7} tokens  {share:>5.1}%", human(bytes / 4));
+            }
+            Ok(())
+        }
+        Cmd::Run { prompt, engine, cwd, model, resume, access, jack_tools, timeout_secs, json } => {
+            use jack_engines::{Access, Engine, Event, RunSpec};
+            let engine = Engine::parse(&engine).with_context(|| format!("unknown engine {engine:?} (claude, cursor)"))?;
+            jack_engines::check_installed(engine)?;
+            let access = match access.as_str() {
+                "read" => Access::Read,
+                "edit" => Access::Edit,
+                "full" => Access::Full,
+                a => anyhow::bail!("unknown access {a:?} (read, edit, full)"),
+            };
+            if jack_tools && engine != Engine::Claude {
+                anyhow::bail!("--jack-tools is only wired up for claude so far");
+            }
+            let cwd = cwd.unwrap_or(std::env::current_dir()?).canonicalize()?;
+            let jack_bin = if jack_tools { Some(std::env::current_exe()?) } else { None };
+            let spec = RunSpec {
+                prompt: prompt.clone(),
+                cwd: cwd.clone(),
+                resume,
+                model,
+                access,
+                jack_tools: jack_bin,
+                timeout: std::time::Duration::from_secs(timeout_secs),
+            };
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+            let dir = jack_home().join("runs").join(format!("{stamp}-{}", engine.name()));
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("spec.json"), json!({"engine": engine.name(), "cwd": cwd, "prompt": prompt, "access": access}).to_string())?;
+            let r = jack_engines::run(engine, &spec, &dir.join("events.jsonl"), |e| match e {
+                Event::Started { session_id, model } => {
+                    eprintln!("[{}] session {session_id} ({})", engine.name(), model.as_deref().unwrap_or("?"))
+                }
+                Event::Tool { name, detail } => eprintln!("  -> {name} {detail}"),
+                Event::ToolDone { name, ok: false } => eprintln!("  !! {name} failed"),
+                _ => {}
+            })?;
+            std::fs::write(dir.join("result.json"), serde_json::to_string_pretty(&r)?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("{} {}", if r.is_error { "FAILED" } else { "done" }, r.engine);
+                println!("{}", r.summary.trim());
+                if !r.files_changed.is_empty() {
+                    println!("\nchanged: {}", r.files_changed.join(", "));
+                    if !r.diff_stat.is_empty() {
+                        println!("{}", r.diff_stat);
+                    }
+                }
+                let u = &r.usage;
+                println!(
+                    "\nsession {}  turns {}  tools {}  {:.1}s",
+                    r.session_id.as_deref().unwrap_or("?"),
+                    r.num_turns.map_or("?".into(), |n| n.to_string()),
+                    r.tool_calls.len(),
+                    r.duration_ms as f64 / 1000.0
+                );
+                println!(
+                    "tokens: input {}  cache read {}  cache write {}  output {}{}",
+                    human(u.input), human(u.cache_read), human(u.cache_write), human(u.output),
+                    r.session_cost_usd.map_or(String::new(), |c| format!("  (session api ${c:.3})"))
+                );
+                println!("log: {}", dir.display());
+            }
+            if r.is_error {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Runs { limit } => {
+            let mut dirs: Vec<PathBuf> = std::fs::read_dir(jack_home().join("runs"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.join("result.json").exists())
+                .collect();
+            dirs.sort();
+            dirs.reverse();
+            println!("{:<22} {:<7} {:<6} {:>6} {:>8} {:>8} {:>8}  task", "run", "engine", "status", "tools", "cache rd", "output", "sess $");
+            for d in dirs.into_iter().take(limit) {
+                let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("result.json"))?)?;
+                let spec: serde_json::Value = std::fs::read_to_string(d.join("spec.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+                let task: String = spec["prompt"].as_str().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ").chars().take(50).collect();
+                println!(
+                    "{:<22} {:<7} {:<6} {:>6} {:>8} {:>8} {:>8}  {task}",
+                    d.file_name().unwrap_or_default().to_string_lossy(),
+                    r["engine"].as_str().unwrap_or("?"),
+                    if r["is_error"].as_bool().unwrap_or(false) { "error" } else { "ok" },
+                    r["tool_calls"].as_array().map_or(0, Vec::len),
+                    human(r["usage"]["cache_read"].as_i64().unwrap_or(0)),
+                    human(r["usage"]["output"].as_i64().unwrap_or(0)),
+                    r["session_cost_usd"].as_f64().map_or("-".into(), |c| format!("{c:.3}")),
+                );
             }
             Ok(())
         }

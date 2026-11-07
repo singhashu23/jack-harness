@@ -248,16 +248,19 @@ pub fn semantic_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "jack_def",
+            "annotations": {"readOnlyHint": true, "openWorldHint": false},
             "description": "Go to a symbol's definition using the language server (type-aware, follows imports across files). Returns the definition's code, so no separate file read is needed.",
             "inputSchema": {"type": "object", "properties": aim_props(json!({})), "required": ["symbol", "path"], "additionalProperties": false}
         }),
         json!({
             "name": "jack_refs",
+            "annotations": {"readOnlyHint": true, "openWorldHint": false},
             "description": "Find every reference to a symbol using the language server: exact, not a text search. Results are grouped by file with each line's code.",
             "inputSchema": {"type": "object", "properties": aim_props(json!({"max": {"type": "integer", "description": "Lines to show, default 60"}})), "required": ["symbol", "path"], "additionalProperties": false}
         }),
         json!({
             "name": "jack_rename",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false},
             "description": "Rename a symbol everywhere it is used, via the language server, and write the changes to disk. Use dry_run=true to only list the files it would change.",
             "inputSchema": {"type": "object", "properties": aim_props(json!({
                 "new_name": {"type": "string"},
@@ -266,6 +269,7 @@ pub fn semantic_tools() -> Vec<Value> {
         }),
         json!({
             "name": "jack_diagnostics",
+            "annotations": {"readOnlyHint": true, "openWorldHint": false},
             "description": "Errors and warnings for a file from its language server (for Rust this includes cargo check). Faster and much shorter than running a full build.",
             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false}
         }),

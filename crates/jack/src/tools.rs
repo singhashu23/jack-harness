@@ -392,6 +392,7 @@ pub fn tool_list() -> Value {
     let mut tools = json!([
         {
             "name": "jack_read",
+            "annotations": {"readOnlyHint": true, "openWorldHint": false},
             "description": "Read a file, token-efficiently. Small files come back whole with line numbers. Large files return an outline (symbols with line ranges); then read only what you need with symbol= or lines=. Re-reading a file you already saw returns 'unchanged' or just a diff. Prefer this over any other file-reading tool.",
             "inputSchema": {
                 "type": "object",
@@ -407,6 +408,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "jack_search",
+            "annotations": {"readOnlyHint": true, "openWorldHint": false},
             "description": "Search the codebase with ripgrep. Results are grouped by file, at most 5 lines per file. Use it to find where something is defined or used before reading files.",
             "inputSchema": {
                 "type": "object",
@@ -422,6 +424,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "jack_sh",
+            "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
             "description": "Run a shell command in the project root. Long output is trimmed to its head, its error and warning lines, and its tail; the full output is stored and can be paged with recall. Prefer this for builds, tests and other commands with long output.",
             "inputSchema": {
                 "type": "object",
@@ -435,6 +438,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "recall",
+            "annotations": {"readOnlyHint": true, "openWorldHint": false},
             "description": "Get back output that jack trimmed or stored this session: page through a stored output by handle, or search everything stored by keyword.",
             "inputSchema": {
                 "type": "object",
@@ -448,6 +452,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "checkpoint",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "description": "Save a short note about progress: a decision made, a fact learned, or what is left to do. jack uses these notes to brief later sessions.",
             "inputSchema": {
                 "type": "object",

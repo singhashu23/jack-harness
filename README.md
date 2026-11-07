@@ -11,6 +11,7 @@ Agent, Goose) can use today.
 | --- | --- |
 | `jack-store` | One SQLite file per session: content-addressed blobs, an FTS5 index for `recall`, what each file looked like when last shown, and a tool-call log with raw vs. sent bytes |
 | `jack-lsp` | A dependency-free LSP client: starts language servers on demand and answers definition, references, rename and diagnostics |
+| `jack-engines` | Engine adapters: run Claude Code or Cursor Agent headless and normalize the result (session id, summary, files changed, tokens, cost) |
 | `jack-read` | tree-sitter outlines (Rust, Python, TypeScript/TSX, JavaScript, Go), symbol lookup, line slicing, diffs, output trimming |
 | `jack` | The binary: MCP server (`jack mcp`), recorder (`jack hook record`, `jack import`) and CLI (`jack read`, `jack outline`, `jack stats`, `jack sessions`) |
 
@@ -43,6 +44,23 @@ jack import          # backfill every transcript in ~/.claude/projects
 jack sessions        # tokens and approximate API cost per session
 jack session <id>    # model usage and which tools filled the context
 ```
+
+## Driving other agents
+
+```sh
+jack run "fix the failing test in parser.rs"                  # Claude Code, edits allowed
+jack run --engine cursor "add a --verbose flag"               # Cursor Agent (your Cursor model)
+jack run --access read "explain how auth works"               # read-only
+jack run --access full "run the tests and fix failures"       # edits + shell
+jack run --resume <session id> "now add a test for it"        # continue a session
+jack run --jack-tools "..."                                   # Claude with jack's MCP tools; built-in Read disabled
+jack runs                                                     # history
+```
+
+Each run is saved in `~/.jack/runs/<id>/` (spec, raw event stream, result). Files
+changed are taken from git, and files that were already modified before the run are
+not counted. With `--jack-tools`, only the jack tools allowed at that access level
+are pre-approved: `jack_sh` needs `full`, and `jack_rename` needs `edit`.
 
 ## Use
 
